@@ -78,6 +78,7 @@ namespace Runner {
 	extern atomic<bool> coreNum_reset;
 	extern bool pause_output;
 	extern string debug_bg;
+	extern atomic<const char*> runner_phase;
 
 	void run(const string& box = "", bool no_update = false, bool force_redraw = false);
 	void stop();

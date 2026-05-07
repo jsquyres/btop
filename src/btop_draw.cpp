@@ -2215,7 +2215,7 @@ namespace Proc {
 
 namespace Draw {
 	void calcSizes() {
-		atomic_wait(Runner::active);
+		atomic_wait_logged(Runner::active, true, "Draw::calcSizes()", Runner::runner_phase);
 		Config::unlock();
 		auto boxes = Config::getS("shown_boxes");
 		auto cpu_bottom = Config::getB("cpu_bottom");

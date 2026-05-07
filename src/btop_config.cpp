@@ -659,7 +659,7 @@ namespace Config {
 
 	void unlock() {
 		if (not locked) return;
-		atomic_wait(Runner::active);
+		atomic_wait_logged(Runner::active, true, "Config::unlock()", Runner::runner_phase);
 		atomic_lock lck(writelock, true);
 		try {
 			if (Proc::shown) {
