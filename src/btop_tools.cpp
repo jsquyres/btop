@@ -550,6 +550,24 @@ namespace Tools {
 		while (atom.load(std::memory_order_relaxed) == old and (time_ms() - start_time < wait_ms)) sleep_ms(1);
 	}
 
+	void atomic_wait_logged(const atomic<bool>& atom, bool old, const char* caller, const atomic<const char*>& phase) noexcept {
+		if (atom.load(std::memory_order_relaxed) != old) return;
+		const uint64_t start = time_ms();
+		uint64_t last_log = 0;
+		while (atom.load(std::memory_order_relaxed) == old) {
+			atomic_wait_for(atom, old, 1000);
+			const uint64_t elapsed = time_ms() - start;
+			if (elapsed >= 1000 and elapsed - last_log >= 1000) {
+				Logger::warning("{} blocked for {}ms waiting on Runner::active (runner_phase={})",
+					caller, elapsed, phase.load(std::memory_order_relaxed));
+				last_log = elapsed;
+			}
+		}
+		const uint64_t total = time_ms() - start;
+		if (total > 500)
+			Logger::info("{} wait completed after {}ms", caller, total);
+	}
+
 	atomic_lock::atomic_lock(atomic<bool>& atom, bool wait) : atom(atom) {
 		if (wait) while (not this->atom.compare_exchange_strong(this->not_true, true));
 		else this->atom.store(true);

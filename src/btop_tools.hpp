@@ -368,6 +368,8 @@ namespace Tools {
 
 	void atomic_wait_for(const atomic<bool>& atom, bool old = true, const uint64_t wait_ms = 0) noexcept;
 
+	void atomic_wait_logged(const atomic<bool>& atom, bool old, const char* caller, const atomic<const char*>& phase) noexcept;
+
 	//* Sets atomic<bool> to true on construct, sets to false on destruct
 	class atomic_lock {
 		atomic<bool>& atom;

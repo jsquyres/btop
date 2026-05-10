@@ -138,9 +138,18 @@ namespace Runner {
 //* Handler for SIGWINCH and general resizing events, does nothing if terminal hasn't been resized unless force=true
 void term_resize(bool force) {
 	static atomic<bool> resizing (false);
+	static atomic<bool> sigwinch_reentrant_detected (false);
+	if (sigwinch_reentrant_detected.exchange(false)) {
+		Logger::warning("term_resize() reentrant SIGWINCH was detected and deferred (would have deadlocked on resizing atomic)");
+	}
 	if (Input::polling) {
 		Global::resized = true;
 		Input::interrupt();
+		return;
+	}
+	if (resizing.load()) {
+		sigwinch_reentrant_detected.store(true);
+		Global::resized = true;
 		return;
 	}
 	atomic_lock lck(resizing, true);
@@ -427,6 +436,11 @@ namespace Runner {
 	atomic<bool> redraw (false);
 	atomic<bool> coreNum_reset (false);
 
+	atomic<const char*> runner_phase{"idle"};
+	atomic<uint64_t> runner_cycle_count{0};
+	atomic<bool> cooperative_stop_requested{false};
+	static uint64_t pause_output_cycles{0};
+
 	static inline auto set_active(bool value) noexcept {
 		active.store(value, std::memory_order_relaxed);
 		active.notify_all();
@@ -549,6 +563,9 @@ namespace Runner {
 				stopping = true;
 			}
 			if (stopping or Global::resized) {
+				if (cooperative_stop_requested.exchange(false))
+					Logger::warning("Runner thread observed cooperative stop request (runner_phase={})",
+						runner_phase.load(std::memory_order_relaxed));
 				sleep_ms(1);
 				continue;
 			}
@@ -580,6 +597,7 @@ namespace Runner {
 
 			//* Run collection and draw functions for all boxes
 			try {
+				runner_phase.store("starting", std::memory_order_relaxed);
 #if defined(GPU_SUPPORT)
 				//? GPU data collection
 				const bool gpu_in_cpu_panel = Gpu::gpu_names.size() > 0 and (
@@ -596,6 +614,7 @@ namespace Runner {
 
 				vector<Gpu::gpu_info> gpus;
 				if (gpu_in_cpu_panel or not gpu_panels.empty()) {
+					runner_phase.store("gpu_collect", std::memory_order_relaxed);
 					if (Global::debug) debug_timer("gpu", collect_begin);
 					gpus = Gpu::collect(conf.no_update);
 					if (Global::debug) debug_timer("gpu", collect_done);
@@ -606,6 +625,7 @@ namespace Runner {
 				//? CPU
 				if (v_contains(conf.boxes, "cpu")) {
 					try {
+						runner_phase.store("cpu_collect", std::memory_order_relaxed);
 						if (Global::debug) debug_timer("cpu", collect_begin);
 
 						//? Start collect
@@ -660,6 +680,7 @@ namespace Runner {
 				//? MEM
 				if (v_contains(conf.boxes, "mem")) {
 					try {
+						runner_phase.store("mem_collect", std::memory_order_relaxed);
 						if (Global::debug) debug_timer("mem", collect_begin);
 
 						//? Start collect
@@ -680,6 +701,7 @@ namespace Runner {
 				//? NET
 				if (v_contains(conf.boxes, "net")) {
 					try {
+						runner_phase.store("net_collect", std::memory_order_relaxed);
 						if (Global::debug) debug_timer("net", collect_begin);
 
 						//? Start collect
@@ -700,6 +722,7 @@ namespace Runner {
 				//? PROC
 				if (v_contains(conf.boxes, "proc")) {
 					try {
+						runner_phase.store("proc_collect", std::memory_order_relaxed);
 						if (Global::debug) debug_timer("proc", collect_begin);
 
 						//? Start collect
@@ -790,12 +813,31 @@ namespace Runner {
 				}
 			}
 
+			runner_phase.store("drawing", std::memory_order_relaxed);
+
+			++runner_cycle_count;
+			if (pause_output) {
+				++pause_output_cycles;
+				if (pause_output_cycles == 10 or (pause_output_cycles > 0 and pause_output_cycles % 100 == 0))
+					Logger::debug("pause_output stuck true for {} consecutive cycles (overlay_empty={} background_update={} Menu::active={})",
+						pause_output_cycles, conf.overlay.empty(), conf.background_update, Menu::active.load());
+			} else {
+				if (pause_output_cycles >= 10)
+					Logger::debug("pause_output cleared after {} cycles", pause_output_cycles);
+				pause_output_cycles = 0;
+			}
+
+			if (runner_cycle_count % 300 == 0)
+				Logger::debug("Runner health: cycle={} output_size={} pause_output={} overlay_empty={} boxes={}",
+					runner_cycle_count, output.size(), pause_output, conf.overlay.empty(), conf.boxes.size());
+
 			//? If overlay isn't empty, print output without color and then print overlay on top
 			const bool term_sync = Config::getB("terminal_sync");
 			cout << (term_sync ? Term::sync_start : "") << (conf.overlay.empty()
 					? output
 					: (output.empty() ? "" : Fx::ub + Theme::c("inactive_fg") + Fx::uncolor(output)) + conf.overlay)
 				<< (term_sync ? Term::sync_end : "") << flush;
+			runner_phase.store("idle", std::memory_order_relaxed);
 		}
 		//* ----------------------------------------------- THREAD LOOP -----------------------------------------------
 		return {};
@@ -806,14 +848,19 @@ namespace Runner {
 	void run(const string& box, bool no_update, bool force_redraw) {
 		atomic_wait_for(active, true, 5000);
 		if (active) {
-			Logger::error("Stall in Runner thread, requesting cooperative stop!");
+			Logger::error("Stall in Runner thread (runner_phase={} pause_output={} cycle={}), requesting cooperative stop!",
+				runner_phase.load(std::memory_order_relaxed), pause_output, runner_cycle_count.load(std::memory_order_relaxed));
 			stopping = true;
+			cooperative_stop_requested = true;
 			if (waiting) thread_trigger();
 			atomic_wait_for(active, true, 1000);
 			if (not active) {
+				Logger::warning("Runner thread cooperatively stopped after stall recovery request");
 				stopping = false;
 				return;
 			}
+			cooperative_stop_requested = false;
+			Logger::error("Runner thread did not stop cooperatively; re-executing btop");
 			Global::exit_error_msg = "Runner thread stalled; re-executing btop.";
 			restart_self(1);
 		}
