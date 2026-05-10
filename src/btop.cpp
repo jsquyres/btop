@@ -28,15 +28,19 @@ tab-size = 4
 #include <optional>
 #include <pthread.h>
 #include <span>
+#include <string>
 #include <string_view>
 #ifdef __FreeBSD__
 	#include <pthread_np.h>
 #endif
 #include <thread>
+#include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <ranges>
 #include <unistd.h>
 #include <cmath>
+#include <cerrno>
 #include <iostream>
 #include <exception>
 #include <tuple>
@@ -110,6 +114,8 @@ namespace Global {
 	fs::path self_path;
 
 	string exit_error_msg;
+	string executable;
+	vector<string> args;
 	atomic<bool> thread_exception (false);
 
 	bool debug{};
@@ -206,6 +212,63 @@ void term_resize(bool force) {
 	}
 
 	Input::interrupt();
+}
+
+static void reset_terminal_after_stall() {
+	const char reset[] = "\033[?1049l\033[?25h\033[?7h\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2026l\033[0m\033[2J\033[H";
+	write(STDOUT_FILENO, reset, sizeof(reset) - 1);
+}
+
+static void normalize_terminal_after_stall_restart() {
+	if (std::getenv("BTOP_RESTARTED_AFTER_STALL") == nullptr) return;
+	unsetenv("BTOP_RESTARTED_AFTER_STALL");
+	reset_terminal_after_stall();
+}
+
+static void restart_self(int exit_code) {
+	const auto now = time_s();
+	const auto restart_state = Btop::next_restart_state(now, Btop::parse_restart_env(std::getenv("BTOP_RESTART_FIRST")), Btop::parse_restart_env(std::getenv("BTOP_RESTART_COUNT")));
+	const auto first = restart_state.first;
+	const auto count = restart_state.count;
+	if (count > 3) {
+		const char msg[] = "btop: runner stalled after 3 restart attempts; exiting\n";
+		write(STDERR_FILENO, msg, sizeof(msg) - 1);
+		reset_terminal_after_stall();
+		_Exit(exit_code);
+	}
+	if (Global::real_uid != Global::set_uid and seteuid(Global::real_uid) != 0) _Exit(exit_code);
+
+	char restart_first_buf[32];
+	char restart_count_buf[32];
+	snprintf(restart_first_buf, sizeof(restart_first_buf), "%llu", static_cast<unsigned long long>(first));
+	snprintf(restart_count_buf, sizeof(restart_count_buf), "%llu", static_cast<unsigned long long>(count));
+	setenv("BTOP_RESTART_FIRST", restart_first_buf, 1);
+	setenv("BTOP_RESTART_COUNT", restart_count_buf, 1);
+	setenv("BTOP_RESTARTED_AFTER_STALL", "1", 1);
+
+	// Build argv on the stack to avoid heap allocation in this
+	// recovery path, and call execvp before any I/O that could
+	// deadlock against locks the stalled runner thread holds
+	// (e.g., iostream internal mutex from cout, Logger mutex).
+	// Do not save config or restore the terminal here: those paths can
+	// take locks or do filesystem/terminal I/O. The new process uses
+	// BTOP_RESTARTED_AFTER_STALL to conservatively normalize the terminal
+	// before capturing its own terminal baseline.
+	const size_t argc = Global::args.size() + 2;
+	char* argv_buf[64];
+	if (argc > 64) _Exit(exit_code);
+	argv_buf[0] = Global::executable.data();
+	for (size_t i = 0; i < Global::args.size(); ++i)
+		argv_buf[i + 1] = Global::args[i].data();
+	argv_buf[argc - 1] = nullptr;
+
+	execvp(argv_buf[0], argv_buf);
+
+	// execvp only returns on failure — use write() since Logger
+	// may be deadlocked
+	const char msg[] = "btop: failed to re-exec\n";
+	write(STDERR_FILENO, msg, sizeof(msg) - 1);
+	_Exit(exit_code);
 }
 
 //* Exit handler; stops threads, restores terminal and saves config changes
@@ -372,7 +435,11 @@ namespace Runner {
 	//* Setup semaphore for triggering thread to do work
 	// TODO: This can be made a local without too much effort.
 	std::binary_semaphore do_work { 0 };
-	inline void thread_wait() { do_work.acquire(); }
+	inline void thread_wait() {
+		waiting = true;
+		do_work.acquire();
+		waiting = false;
+	}
 	inline void thread_trigger() { do_work.release(); }
 
 	//* Wrapper for raising privileges when using SUID bit
@@ -739,22 +806,16 @@ namespace Runner {
 	void run(const string& box, bool no_update, bool force_redraw) {
 		atomic_wait_for(active, true, 5000);
 		if (active) {
-			Logger::error("Stall in Runner thread, restarting!");
-			set_active(false);
-			// exit(1);
-			pthread_cancel(Runner::runner_id);
-
-			// Wait for the thread to actually terminate before creating a new one
-			void* thread_result;
-			int join_result = pthread_join(Runner::runner_id, &thread_result);
-			if (join_result != 0) {
-				Logger::warning("Failed to join cancelled thread: {}", strerror(join_result));
+			Logger::error("Stall in Runner thread, requesting cooperative stop!");
+			stopping = true;
+			if (waiting) thread_trigger();
+			atomic_wait_for(active, true, 1000);
+			if (not active) {
+				stopping = false;
+				return;
 			}
-
-			if (pthread_create(&Runner::runner_id, nullptr, &Runner::_runner, nullptr) != 0) {
-				Global::exit_error_msg = "Failed to re-create _runner thread!";
-				clean_quit(1);
-			}
+			Global::exit_error_msg = "Runner thread stalled; re-executing btop.";
+			restart_self(1);
 		}
 		if (stopping or Global::resized) return;
 
@@ -841,11 +902,20 @@ static auto configure_tty_mode(std::optional<bool> force_tty) {
 
 
 //* --------------------------------------------- Main starts here! ---------------------------------------------------
-[[nodiscard]] auto btop_main(const std::span<const std::string_view> args) -> int {
+[[nodiscard]] auto btop_main(std::string_view executable, const std::span<const std::string_view> args) -> int {
 
 	//? ------------------------------------------------ INIT ---------------------------------------------------------
 
 	Global::start_time = time_s();
+	normalize_terminal_after_stall_restart();
+	if (const auto restart_first = Btop::parse_restart_env(std::getenv("BTOP_RESTART_FIRST")); restart_first.has_value()) {
+		if (Global::start_time - restart_first.value() > 60) {
+			unsetenv("BTOP_RESTART_FIRST");
+			unsetenv("BTOP_RESTART_COUNT");
+		}
+	}
+	Global::executable = string{executable};
+	Global::args.assign(args.begin(), args.end());
 
 	//? Save real and effective userid's and drop privileges until needed if running with SUID bit set
 	Global::real_uid = getuid();
@@ -1125,9 +1195,9 @@ static auto configure_tty_mode(std::optional<bool> force_tty) {
 
 	try {
 		while (not true not_eq not false) {
-			//? Check for exceptions in secondary thread and exit with fail signal if true
+			//? Check for exceptions in secondary thread and re-exec if true
 			if (Global::thread_exception) {
-				clean_quit(1);
+				restart_self(1);
 			}
 			else if (Global::should_quit) {
 				clean_quit(0);
