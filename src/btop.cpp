@@ -24,6 +24,7 @@ tab-size = 4
 #include <clocale>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <pthread.h>
@@ -110,6 +111,8 @@ namespace Global {
 	fs::path self_path;
 
 	string exit_error_msg;
+	string executable;
+	vector<string> args;
 	atomic<bool> thread_exception (false);
 
 	bool debug{};
@@ -206,6 +209,66 @@ void term_resize(bool force) {
 	}
 
 	Input::interrupt();
+}
+
+static void reset_terminal_after_stall() {
+	const char reset[] = "\033[?1049l\033[?25h\033[?7h\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2026l\033[0m\033[2J\033[H";
+	write(STDOUT_FILENO, reset, sizeof(reset) - 1);
+}
+
+static void normalize_terminal_after_stall_restart() {
+	if (std::getenv("BTOP_RESTARTED_AFTER_STALL") == nullptr) return;
+	unsetenv("BTOP_RESTARTED_AFTER_STALL");
+	reset_terminal_after_stall();
+}
+
+static auto parse_restart_env(const char* value) -> std::optional<uint64_t> {
+	if (value == nullptr or *value == '\0') return std::nullopt;
+	uint64_t result{};
+	for (const char* cursor = value; *cursor != '\0'; ++cursor) {
+		if (*cursor < '0' or *cursor > '9') return std::nullopt;
+		const auto digit = static_cast<uint64_t>(*cursor - '0');
+		if (result > (std::numeric_limits<uint64_t>::max() - digit) / 10) return std::nullopt;
+		result = result * 10 + digit;
+	}
+	return result;
+}
+
+static void restart_self(int exit_code) {
+	const auto now = time_s();
+	const auto restart_first = parse_restart_env(std::getenv("BTOP_RESTART_FIRST"));
+	const auto restart_count = parse_restart_env(std::getenv("BTOP_RESTART_COUNT"));
+	const auto first = restart_first.value_or(now);
+	const auto count = (restart_count.has_value() and now - first <= 60) ? (restart_count.value() >= 3 ? 4 : restart_count.value() + 1) : 1;
+	if (count > 3) {
+		const char msg[] = "btop: runner stalled after 3 restart attempts; exiting\n";
+		write(STDERR_FILENO, msg, sizeof(msg) - 1);
+		_Exit(exit_code);
+	}
+
+	char restart_first_buf[32];
+	char restart_count_buf[32];
+	snprintf(restart_first_buf, sizeof(restart_first_buf), "%llu", static_cast<unsigned long long>(first));
+	snprintf(restart_count_buf, sizeof(restart_count_buf), "%llu", static_cast<unsigned long long>(count));
+	setenv("BTOP_RESTART_FIRST", restart_first_buf, 1);
+	setenv("BTOP_RESTART_COUNT", restart_count_buf, 1);
+	setenv("BTOP_RESTARTED_AFTER_STALL", "1", 1);
+	if (Global::real_uid != Global::set_uid and seteuid(Global::real_uid) != 0) _Exit(exit_code);
+
+	const size_t argc = Global::args.size() + 2;
+	char* argv_buf[64];
+	if (argc > 64) _Exit(exit_code);
+	argv_buf[0] = Global::executable.data();
+	for (size_t i = 0; i < Global::args.size(); ++i) {
+		argv_buf[i + 1] = Global::args[i].data();
+	}
+	argv_buf[argc - 1] = nullptr;
+
+	execvp(argv_buf[0], argv_buf);
+
+	const char msg[] = "btop: failed to re-exec\n";
+	write(STDERR_FILENO, msg, sizeof(msg) - 1);
+	_Exit(exit_code);
 }
 
 //* Exit handler; stops threads, restores terminal and saves config changes
@@ -739,22 +802,9 @@ namespace Runner {
 	void run(const string& box, bool no_update, bool force_redraw) {
 		atomic_wait_for(active, true, 5000);
 		if (active) {
-			Logger::error("Stall in Runner thread, restarting!");
-			set_active(false);
-			// exit(1);
-			pthread_cancel(Runner::runner_id);
-
-			// Wait for the thread to actually terminate before creating a new one
-			void* thread_result;
-			int join_result = pthread_join(Runner::runner_id, &thread_result);
-			if (join_result != 0) {
-				Logger::warning("Failed to join cancelled thread: {}", strerror(join_result));
-			}
-
-			if (pthread_create(&Runner::runner_id, nullptr, &Runner::_runner, nullptr) != 0) {
-				Global::exit_error_msg = "Failed to re-create _runner thread!";
-				clean_quit(1);
-			}
+			Logger::error("Stall in Runner thread, re-executing btop!");
+			Global::exit_error_msg = "Runner thread stalled; re-executing btop.";
+			restart_self(1);
 		}
 		if (stopping or Global::resized) return;
 
@@ -841,11 +891,20 @@ static auto configure_tty_mode(std::optional<bool> force_tty) {
 
 
 //* --------------------------------------------- Main starts here! ---------------------------------------------------
-[[nodiscard]] auto btop_main(const std::span<const std::string_view> args) -> int {
+[[nodiscard]] auto btop_main(std::string_view executable, const std::span<const std::string_view> args) -> int {
 
 	//? ------------------------------------------------ INIT ---------------------------------------------------------
 
 	Global::start_time = time_s();
+	normalize_terminal_after_stall_restart();
+	if (const auto restart_first = parse_restart_env(std::getenv("BTOP_RESTART_FIRST")); restart_first.has_value()) {
+		if (Global::start_time - restart_first.value() > 60) {
+			unsetenv("BTOP_RESTART_FIRST");
+			unsetenv("BTOP_RESTART_COUNT");
+		}
+	}
+	Global::executable = string{executable};
+	Global::args.assign(args.begin(), args.end());
 
 	//? Save real and effective userid's and drop privileges until needed if running with SUID bit set
 	Global::real_uid = getuid();
