@@ -151,6 +151,7 @@ target_compile_definitions(libbtop PUBLIC
   FMT_HEADER_ONLY
   _FILE_OFFSET_BITS=64
   $<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
+  $<$<BOOL:${BUILD_TESTING}>:BTOP_TESTING>
 )
 
 target_include_directories(libbtop SYSTEM PUBLIC include)
